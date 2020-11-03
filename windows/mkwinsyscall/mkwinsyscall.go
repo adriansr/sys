@@ -165,6 +165,22 @@ func (p *Param) TmpVarCode() string {
 	}
 }
 
+// Var32_64Code returns source code for the temp variable necessary
+// to split a 64-bit parameter into two 32-bit parts.
+func (p *Param) Var32_64Code() string {
+	if !p.Is64BitParam() {
+		return ""
+	}
+	const code = `var %[1]s [2]uintptr = *(*[2]uintptr)(unsafe.Pointer(&%[2]s))`
+	return fmt.Sprintf(code, p.tmpVar(), p.Name)
+}
+
+// Is64BitParams returns true if this Param is 64-bit long
+// even under a 32-bit architecture.
+func (p *Param) Is64BitParam() bool {
+	return p.Type == "int64" || p.Type == "uint64" || p.Type == "float64"
+}
+
 // TmpVarReadbackCode returns source code for reading back the temp variable into the original variable.
 func (p *Param) TmpVarReadbackCode() string {
 	switch {
@@ -210,6 +226,19 @@ func (p *Param) SyscallArgList() []string {
 		s = p.Name
 	}
 	return []string{fmt.Sprintf("uintptr(%s)", s)}
+}
+
+// SyscallArgList32_64 returns source code fragments representing p parameter
+// in syscall. Parameters that are 64-bit long in a 32-bit arch are passed
+// as two parameters.
+func (p *Param) SyscallArgList32_64() []string {
+	if p.Is64BitParam() {
+		return []string {
+			fmt.Sprintf("%s[0]", p.tmpVar()),
+			fmt.Sprintf("%s[1]", p.tmpVar()),
+		}
+	}
+	return p.SyscallArgList()
 }
 
 // IsError determines if p parameter is used to return error.
@@ -285,8 +314,9 @@ func (r *Rets) PrintList() string {
 	return join(r.ToParams(), func(p *Param) string { return fmt.Sprintf(`"%s=", %s, `, p.Name, p.Name) }, `", ", `)
 }
 
-// SetReturnValuesCode returns source code that accepts syscall return values.
-func (r *Rets) SetReturnValuesCode() string {
+// ReturnValuesCode returns source code that accepts syscall return values.
+// setOp is the desired assignment operator, "=" or ":=".
+func (r *Rets) SetReturnValuesCode(setOp string) string {
 	if r.Name == "" && !r.ReturnsError {
 		return ""
 	}
@@ -298,7 +328,27 @@ func (r *Rets) SetReturnValuesCode() string {
 	if r.ReturnsError {
 		errvar = "e1"
 	}
-	return fmt.Sprintf("%s, _, %s := ", retvar, errvar)
+	return fmt.Sprintf("%s, _, %s %s", retvar, errvar, setOp)
+}
+
+// DeclareReturnValuesCode returns source code to declare syscall return values.
+func (r *Rets) DeclareReturnValuesCode() string {
+	if r.Name == "" && !r.ReturnsError {
+		return ""
+	}
+	retvar := "r0"
+	if r.Name == "" {
+		retvar = "r1"
+	}
+	errvar := "_"
+	if r.ReturnsError {
+		errvar = "e1"
+	}
+	const code = `var (
+		%[1]s uintptr
+		%[2]s %[3]sErrno
+	)`
+	return fmt.Sprintf(code, retvar, errvar, syscalldot())
 }
 
 func (r *Rets) useLongHandleErrorCode(retvar string) string {
@@ -518,10 +568,20 @@ func (f *Fn) ParamCount() int {
 	return n
 }
 
-// SyscallParamCount determines which version of Syscall/Syscall6/Syscall9/...
-// to use. It returns parameter count for correspondent SyscallX function.
-func (f *Fn) SyscallParamCount() int {
-	n := f.ParamCount()
+// ParamCount32_64 return number of syscall parameters for function f
+// when the function runs in a 32-bit arch.
+func (f *Fn) ParamCount32_64() int {
+	n := 0
+	for _, p := range f.Params {
+		n += len(p.SyscallArgList())
+		if p.Is64BitParam() {
+			n += 1
+		}
+	}
+	return n
+}
+
+func syscallParamCount(n int) int {
 	switch {
 	case n <= 3:
 		return 3
@@ -536,6 +596,19 @@ func (f *Fn) SyscallParamCount() int {
 	default:
 		panic("too many arguments to system call")
 	}
+}
+
+// SyscallParamCount determines which version of Syscall/Syscall6/Syscall9/...
+// to use. It returns parameter count for correspondent SyscallX function.
+func (f *Fn) SyscallParamCount() int {
+	return syscallParamCount(f.ParamCount())
+}
+
+
+// SyscallParamCount32_64 determines which version of Syscall/Syscall6/Syscall9/...
+// to use. It returns parameter count for correspondent SyscallX function.
+func (f *Fn) SyscallParamCount32_64() int {
+	return syscallParamCount(f.ParamCount32_64())
 }
 
 // Syscall determines which SyscallX function to use for function f.
@@ -554,6 +627,18 @@ func (f *Fn) SyscallParamList() string {
 		a = append(a, p.SyscallArgList()...)
 	}
 	for len(a) < f.SyscallParamCount() {
+		a = append(a, "0")
+	}
+	return strings.Join(a, ", ")
+}
+
+// SyscallParamList32_64 returns source code for SyscallX parameters for function f.
+func (f *Fn) SyscallParamList32_64() string {
+	a := make([]string, 0)
+	for _, p := range f.Params {
+		a = append(a, p.SyscallArgList32_64()...)
+	}
+	for len(a) < f.SyscallParamCount32_64() {
 		a = append(a, "0")
 	}
 	return strings.Join(a, ", ")
@@ -600,6 +685,18 @@ func (f *Fn) StrconvType() string {
 func (f *Fn) HasStringParam() bool {
 	for _, p := range f.Params {
 		if p.Type == "string" {
+			return true
+		}
+	}
+	return false
+}
+
+// Has64BitParam is true, if f has at least one parameter that is
+// 64-bit in length under a 32-bit OS.
+// Otherwise it is false.
+func (f *Fn) Has64BitParam() bool {
+	for _, p := range f.Params {
+		if p.Is64BitParam() {
 			return true
 		}
 	}
@@ -904,7 +1001,7 @@ func {{.Name}}({{.ParamList}}) {{template "results" .}}{
 
 {{define "funcbody"}}
 func {{.HelperName}}({{.HelperParamList}}) {{template "results" .}}{
-{{template "tmpvars" .}}	{{template "syscall" .}}	{{template "tmpvarsreadback" .}}
+{{template "tmpvars" .}}	{{if .Has64BitParam}}{{template "syscall32_64" .}}{{else}}{{template "syscall" .}}{{end}}	{{template "tmpvarsreadback" .}}
 {{template "seterror" .}}{{template "printtrace" .}}	return
 }
 {{end}}
@@ -915,9 +1012,21 @@ func {{.HelperName}}({{.HelperParamList}}) {{template "results" .}}{
 {{define "tmpvars"}}{{range .Params}}{{if .TmpVarCode}}	{{.TmpVarCode}}
 {{end}}{{end}}{{end}}
 
+{{define "vars32_64"}}{{range .Params}}{{if .Var32_64Code}}{{.Var32_64Code}}
+{{end}}{{end}}{{end}}
+
 {{define "results"}}{{if .Rets.List}}{{.Rets.List}} {{end}}{{end}}
 
-{{define "syscall"}}{{.Rets.SetReturnValuesCode}}{{.Syscall}}(proc{{.DLLFuncName}}.Addr(), {{.ParamCount}}, {{.SyscallParamList}}){{end}}
+{{define "syscall32_64"}} {{.Rets.DeclareReturnValuesCode}}
+	if unsafe.Sizeof(uintptr(0)) == unsafe.Sizeof(uint64(0)) {
+		{{.Rets.SetReturnValuesCode "="}}{{.Syscall}}(proc{{.DLLFuncName}}.Addr(), {{.ParamCount}}, {{.SyscallParamList}})
+	} else {
+		{{template "vars32_64" .}}
+		{{.Rets.SetReturnValuesCode "="}}{{.Syscall}}(proc{{.DLLFuncName}}.Addr(), {{.ParamCount32_64}}, {{.SyscallParamList32_64}})
+	}
+{{end}}
+
+{{define "syscall"}}{{.Rets.SetReturnValuesCode ":="}}{{.Syscall}}(proc{{.DLLFuncName}}.Addr(), {{.ParamCount}}, {{.SyscallParamList}}){{end}}
 
 {{define "tmpvarsreadback"}}{{range .Params}}{{if .TmpVarReadbackCode}}
 {{.TmpVarReadbackCode}}{{end}}{{end}}{{end}}
